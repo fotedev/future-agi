@@ -12,12 +12,12 @@ import (
 
 // Agent represents a configured external A2A agent.
 type Agent struct {
-	Name        string   `json:"name"`
-	URL         string   `json:"url"`
-	Auth        A2AAuth  `json:"-"`
-	Card        *AgentCard `json:"card,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Skills      []Skill  `json:"skills,omitempty"`
+	Name        string                    `json:"name"`
+	URL         string                    `json:"url"`
+	Auth        A2AAuth                   `json:"-"`
+	Card        atomic.Pointer[AgentCard] `json:"-"` // set by FetchCards goroutines; read by ListAgents
+	Description string                    `json:"description,omitempty"`
+	Skills      []Skill                   `json:"skills,omitempty"`
 	healthy     atomic.Bool
 }
 
@@ -138,7 +138,8 @@ func (r *Registry) FetchCards(ctx context.Context) {
 				return
 			}
 
-			a.Card = &card
+			// atomic store: ListAgents reads Card concurrently.
+			a.Card.Store(&card)
 			a.healthy.Store(true)
 			slog.Info("a2a: fetched agent card", "agent", a.Name, "skills", len(card.Skills))
 		}(agent)

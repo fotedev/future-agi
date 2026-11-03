@@ -54,6 +54,33 @@ func (s *syncTaskStore) Get(id string) (*Task, bool) {
 	return s.store.Get(id)
 }
 
+// Update applies fn to the stored task under the write lock, so task-field
+// mutations from the background execution goroutine and HTTP handlers
+// cannot race. Returns false when the task is gone (cleaned up).
+func (s *syncTaskStore) Update(id string, fn func(t *Task)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.store.Get(id)
+	if !ok {
+		return false
+	}
+	fn(t)
+	return true
+}
+
+// Snapshot returns a shallow copy of the stored task under the read lock.
+// Safe because every writer replaces Status.Message / Artifacts slices
+// wholesale and History is set once before the first Store.
+func (s *syncTaskStore) Snapshot(id string) (Task, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.store.Get(id)
+	if !ok {
+		return Task{}, false
+	}
+	return *t, true
+}
+
 func (s *syncTaskStore) Cleanup(maxAge time.Duration) {
 	s.mu.Lock()
 	s.store.Cleanup(maxAge)
@@ -143,7 +170,7 @@ func (s *Server) ListAgents(w http.ResponseWriter, r *http.Request) {
 			Description: a.Description,
 			Skills:      a.Skills,
 			Healthy:     a.Healthy(),
-			Card:        a.Card,
+			Card:        a.Card.Load(),
 		})
 	}
 
@@ -213,8 +240,10 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request, msg *
 			s.tasks.Store(task)
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			s.taskCancels.Store(task.ID, cancel)
-			go s.runMessageSendWithPipeline(ctx, r.Header.Get("Authorization"), task, inputText, params)
-			writeA2AResult(w, msg.ID, task)
+			go s.runMessageSendWithPipeline(ctx, r.Header.Get("Authorization"), task.ID, inputText, params)
+			// The goroutine owns task mutation now; respond from a copy.
+			snap, _ := s.tasks.Snapshot(task.ID)
+			writeA2AResult(w, msg.ID, &snap)
 			return
 		}
 
@@ -247,19 +276,26 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request, msg *
 func (s *Server) handleMessageSendWithPipeline(w http.ResponseWriter, msg *mcp.Message, authHeader string, task *Task, inputText string, params MessageSendParams) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	s.runMessageSendWithPipeline(ctx, authHeader, task, inputText, params)
-	writeA2AResult(w, msg.ID, task)
+	s.runMessageSendWithPipeline(ctx, authHeader, task.ID, inputText, params)
+	// A concurrent tasks/get could read while we executed; respond from a copy.
+	snap, _ := s.tasks.Snapshot(task.ID)
+	writeA2AResult(w, msg.ID, &snap)
 }
 
-func (s *Server) runMessageSendWithPipeline(ctx context.Context, authHeader string, task *Task, inputText string, params MessageSendParams) {
-	defer s.taskCancels.Delete(task.ID)
+func (s *Server) runMessageSendWithPipeline(ctx context.Context, authHeader string, taskID string, inputText string, params MessageSendParams) {
+	defer s.taskCancels.Delete(taskID)
+
+	fail := func(state string, text string) {
+		s.tasks.Update(taskID, func(t *Task) {
+			t.Status.State = state
+			t.Status.Message = []MessagePart{{Type: "text", Text: text}}
+		})
+	}
 
 	model := s.resolveA2AModel(params)
 	if model == "" {
-		task.Status.State = TaskStatusFailed
-		task.Status.Message = []MessagePart{{Type: "text", Text: "A2A request must include metadata.model"}}
-		s.tasks.Store(task)
-		slog.Warn("a2a: missing metadata.model", "task_id", task.ID)
+		fail(TaskStatusFailed, "A2A request must include metadata.model")
+		slog.Warn("a2a: missing metadata.model", "task_id", taskID)
 		return
 	}
 
@@ -276,18 +312,13 @@ func (s *Server) runMessageSendWithPipeline(ctx context.Context, authHeader stri
 		resp, err := s.chatExecutor(ctx, authHeader, req)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-				task.Status.State = TaskStatusCanceled
-				task.Status.Message = []MessagePart{{Type: "text", Text: "Task canceled"}}
-				s.tasks.Store(task)
+				fail(TaskStatusCanceled, "Task canceled")
 				return
 			}
-			task.Status.State = TaskStatusFailed
-			task.Status.Message = []MessagePart{{Type: "text", Text: fmt.Sprintf("Pipeline error: %s", err.Error())}}
-			s.tasks.Store(task)
+			fail(TaskStatusFailed, fmt.Sprintf("Pipeline error: %s", err.Error()))
 			return
 		}
-		s.finishTaskFromResponse(task, resp)
-		s.tasks.Store(task)
+		s.finishTaskFromResponse(taskID, resp)
 		return
 	}
 
@@ -298,18 +329,14 @@ func (s *Server) runMessageSendWithPipeline(ctx context.Context, authHeader stri
 	rc.Model = model
 	rc.Request = req
 	rc.IsStream = false
-	rc.SetMetadata("a2a_task_id", task.ID)
+	rc.SetMetadata("a2a_task_id", taskID)
 	rc.SetMetadata("a2a_context_id", params.ContextID)
 	rc.SetMetadata("endpoint_type", "a2a")
 
 	// Resolve provider.
 	provider, err := s.providerRegistry.Resolve(model)
 	if err != nil {
-		task.Status.State = TaskStatusFailed
-		task.Status.Message = []MessagePart{
-			{Type: "text", Text: fmt.Sprintf("No provider for model %q: %s", model, err.Error())},
-		}
-		s.tasks.Store(task)
+		fail(TaskStatusFailed, fmt.Sprintf("No provider for model %q: %s", model, err.Error()))
 		slog.Warn("a2a: provider resolution failed", "model", model, "error", err)
 		return
 	}
@@ -329,45 +356,43 @@ func (s *Server) runMessageSendWithPipeline(ctx context.Context, authHeader stri
 	// Execute pipeline.
 	if err := s.engine.Process(ctx, rc, providerCall); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			task.Status.State = TaskStatusCanceled
-			task.Status.Message = []MessagePart{{Type: "text", Text: "Task canceled"}}
-			s.tasks.Store(task)
-			slog.Info("a2a task canceled", "task_id", task.ID)
+			fail(TaskStatusCanceled, "Task canceled")
+			slog.Info("a2a task canceled", "task_id", taskID)
+			return
+		}
+
+		fail(TaskStatusFailed, fmt.Sprintf("Pipeline error: %s", err.Error()))
+		slog.Warn("a2a: pipeline error", "task_id", taskID, "error", err)
+		return
+	}
+
+	s.finishTaskFromResponse(taskID, rc.Response)
+	slog.Info("a2a task completed (pipeline)", "task_id", taskID, "model", model, "provider", rc.Provider)
+}
+
+// finishTaskFromResponse applies the provider response to the stored task
+// under the store lock.
+func (s *Server) finishTaskFromResponse(taskID string, resp *models.ChatCompletionResponse) {
+	s.tasks.Update(taskID, func(task *Task) {
+		if resp != nil && len(resp.Choices) > 0 {
+			var responseText string
+			if err := json.Unmarshal(resp.Choices[0].Message.Content, &responseText); err != nil {
+				responseText = string(resp.Choices[0].Message.Content)
+			}
+
+			task.Status.State = TaskStatusCompleted
+			task.Status.Message = []MessagePart{{Type: "text", Text: "Completed via pipeline"}}
+			task.Artifacts = []Artifact{{
+				Name:  "response",
+				Index: 0,
+				Parts: []MessagePart{{Type: "text", Text: responseText}},
+			}}
 			return
 		}
 
 		task.Status.State = TaskStatusFailed
-		task.Status.Message = []MessagePart{{Type: "text", Text: fmt.Sprintf("Pipeline error: %s", err.Error())}}
-		s.tasks.Store(task)
-		slog.Warn("a2a: pipeline error", "task_id", task.ID, "error", err)
-		return
-	}
-
-	s.finishTaskFromResponse(task, rc.Response)
-
-	s.tasks.Store(task)
-	slog.Info("a2a task completed (pipeline)", "task_id", task.ID, "model", model, "provider", rc.Provider)
-}
-
-func (s *Server) finishTaskFromResponse(task *Task, resp *models.ChatCompletionResponse) {
-	if resp != nil && len(resp.Choices) > 0 {
-		var responseText string
-		if err := json.Unmarshal(resp.Choices[0].Message.Content, &responseText); err != nil {
-			responseText = string(resp.Choices[0].Message.Content)
-		}
-
-		task.Status.State = TaskStatusCompleted
-		task.Status.Message = []MessagePart{{Type: "text", Text: "Completed via pipeline"}}
-		task.Artifacts = []Artifact{{
-			Name:  "response",
-			Index: 0,
-			Parts: []MessagePart{{Type: "text", Text: responseText}},
-		}}
-		return
-	}
-
-	task.Status.State = TaskStatusFailed
-	task.Status.Message = []MessagePart{{Type: "text", Text: "No response from provider"}}
+		task.Status.Message = []MessagePart{{Type: "text", Text: "No response from provider"}}
+	})
 }
 
 func (s *Server) handleTasksGet(w http.ResponseWriter, msg *mcp.Message) {
@@ -377,9 +402,9 @@ func (s *Server) handleTasksGet(w http.ResponseWriter, msg *mcp.Message) {
 		return
 	}
 
-	task, ok := s.tasks.Get(params.TaskID)
+	snap, ok := s.tasks.Snapshot(params.TaskID)
 	if !ok && params.TaskIDSnake != "" {
-		task, ok = s.tasks.Get(params.TaskIDSnake)
+		snap, ok = s.tasks.Snapshot(params.TaskIDSnake)
 	}
 	if !ok {
 		taskID := params.TaskID
@@ -390,7 +415,7 @@ func (s *Server) handleTasksGet(w http.ResponseWriter, msg *mcp.Message) {
 		return
 	}
 
-	writeA2AResult(w, msg.ID, task)
+	writeA2AResult(w, msg.ID, &snap)
 }
 
 func (s *Server) handleTasksCancel(w http.ResponseWriter, msg *mcp.Message) {
@@ -400,9 +425,9 @@ func (s *Server) handleTasksCancel(w http.ResponseWriter, msg *mcp.Message) {
 		return
 	}
 
-	task, ok := s.tasks.Get(params.TaskID)
+	snap, ok := s.tasks.Snapshot(params.TaskID)
 	if !ok && params.TaskIDSnake != "" {
-		task, ok = s.tasks.Get(params.TaskIDSnake)
+		snap, ok = s.tasks.Snapshot(params.TaskIDSnake)
 	}
 	if !ok {
 		taskID := params.TaskID
@@ -413,13 +438,19 @@ func (s *Server) handleTasksCancel(w http.ResponseWriter, msg *mcp.Message) {
 		return
 	}
 
-	if cancelFn, ok := s.taskCancels.Load(task.ID); ok {
+	if cancelFn, ok := s.taskCancels.Load(snap.ID); ok {
 		cancelFn.(context.CancelFunc)()
 	}
-	task.Status.State = TaskStatusCanceled
-	task.Status.Message = []MessagePart{{Type: "text", Text: "Task canceled"}}
-	s.tasks.Store(task)
-	writeA2AResult(w, msg.ID, task)
+	// Only a working task transitions to canceled; a terminal task keeps its
+	// state (previously cancel flipped completed/failed tasks to canceled).
+	s.tasks.Update(snap.ID, func(t *Task) {
+		if t.Status.State == TaskStatusWorking {
+			t.Status.State = TaskStatusCanceled
+			t.Status.Message = []MessagePart{{Type: "text", Text: "Task canceled"}}
+		}
+	})
+	snap, _ = s.tasks.Snapshot(snap.ID)
+	writeA2AResult(w, msg.ID, &snap)
 }
 
 func (s *Server) resolveA2AModel(params MessageSendParams) string {

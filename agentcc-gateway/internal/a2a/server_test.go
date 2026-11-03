@@ -2,12 +2,16 @@ package a2a
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/futureagi/agentcc-gateway/internal/mcp"
+	"github.com/futureagi/agentcc-gateway/internal/models"
 )
 
 func newTestA2AServer() *Server {
@@ -295,7 +299,98 @@ func TestTasksCancel(t *testing.T) {
 	}
 	var task Task
 	json.Unmarshal(resp.Result, &task)
-	if task.Status.State != TaskStatusCanceled {
-		t.Fatalf("expected canceled, got %s", task.Status.State)
+	// The echo path completed the task before the cancel arrived; cancel only
+	// transitions working tasks, so the terminal state is preserved.
+	if task.Status.State != TaskStatusCompleted {
+		t.Fatalf("expected completed (cancel must not flip terminal tasks), got %s", task.Status.State)
 	}
+}
+
+// TestTasksCancelWorkingTask cancels a task that is still working (driven
+// through a slow chat-completion executor) and asserts it ends canceled.
+func TestTasksCancelWorkingTask(t *testing.T) {
+	release := make(chan struct{})
+	s := NewServer(CardConfig{Name: "test-agentcc", Version: "1.0"}, NewRegistry(nil),
+		WithChatCompletionExecutor(func(ctx context.Context, authHeader string, req *models.ChatCompletionRequest) (*models.ChatCompletionResponse, error) {
+			<-release
+			return &models.ChatCompletionResponse{
+				Choices: []models.Choice{{Message: models.Message{Role: "assistant", Content: json.RawMessage(`"hi"`)}}},
+			}, nil
+		}))
+
+	task := &Task{ID: generateTaskID(), Status: TaskStatus{State: TaskStatusWorking}}
+	s.tasks.Store(task)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.taskCancels.Store(task.ID, cancel)
+	go s.runMessageSendWithPipeline(ctx, "", task.ID, "Hello", MessageSendParams{
+		Metadata: json.RawMessage(`{"model":"gpt-4o"}`),
+	})
+
+	// Cancel while the executor is still blocked.
+	cancelData, _ := json.Marshal(TaskCancelParams{TaskID: task.ID})
+	w := postA2A(t, s, &mcp.Message{
+		JSONRPC: "2.0",
+		ID:      json.RawMessage(`1`),
+		Method:  MethodTasksCancel,
+		Params:  cancelData,
+	})
+	resp := decodeA2AResponse(t, w)
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %s", resp.Error.Message)
+	}
+	var canceled Task
+	json.Unmarshal(resp.Result, &canceled)
+	if canceled.Status.State != TaskStatusCanceled {
+		t.Fatalf("expected canceled, got %s", canceled.Status.State)
+	}
+	close(release)
+}
+
+// TestA2AConcurrentCancelAndGetWhileExecuting is the regression test for the
+// task-store data race named in the CI race-gate carve-out: with the
+// execution goroutine running, concurrent tasks/cancel and tasks/get used to
+// write and read the shared *Task unlocked. Run under -race (make test-race).
+func TestA2AConcurrentCancelAndGetWhileExecuting(t *testing.T) {
+	release := make(chan struct{})
+	var executed sync.WaitGroup
+	executed.Add(1)
+	s := NewServer(CardConfig{Name: "test-agentcc", Version: "1.0"}, NewRegistry(nil),
+		WithChatCompletionExecutor(func(ctx context.Context, authHeader string, req *models.ChatCompletionRequest) (*models.ChatCompletionResponse, error) {
+			<-release
+			executed.Done()
+			return &models.ChatCompletionResponse{
+				Choices: []models.Choice{{Message: models.Message{Role: "assistant", Content: json.RawMessage(`"hi"`)}}},
+			}, nil
+		}))
+
+	task := &Task{ID: generateTaskID(), Status: TaskStatus{State: TaskStatusWorking}}
+	s.tasks.Store(task)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.taskCancels.Store(task.ID, cancel)
+	go s.runMessageSendWithPipeline(ctx, "", task.ID, "Hello", MessageSendParams{
+		Metadata: json.RawMessage(`{"model":"gpt-4o"}`),
+	})
+
+	var wg sync.WaitGroup
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				if i%2 == 0 {
+					getData, _ := json.Marshal(TaskGetParams{TaskID: task.ID})
+					postA2A(t, s, &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage(`9`), Method: MethodTasksGet, Params: getData})
+				} else {
+					cancelData, _ := json.Marshal(TaskCancelParams{TaskID: task.ID})
+					postA2A(t, s, &mcp.Message{JSONRPC: "2.0", ID: json.RawMessage(`9`), Method: MethodTasksCancel, Params: cancelData})
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(release)
+	executed.Wait()
 }
